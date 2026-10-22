@@ -2,13 +2,14 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path("data/freezerflow.db")
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "freezerflow.db"
 
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c=sqlite3.connect(DB_PATH,check_same_thread=False)
     c.row_factory=sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA busy_timeout=5000")
     return c
 
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -30,16 +31,23 @@ def _legacy_tube_unique(c):
 
 def _migrate_tubes(c):
     if not _legacy_tube_unique(c): return
-    c.executescript("""
-    CREATE TABLE tubes_new(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,uid TEXT UNIQUE NOT NULL,sample_name TEXT,
-      box_uid TEXT NOT NULL,position TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'PRESENT',
-      active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,removed_at TEXT);
-    INSERT INTO tubes_new SELECT id,uid,sample_name,box_uid,position,status,active,created_at,removed_at FROM tubes;
-    DROP TABLE tubes;
-    ALTER TABLE tubes_new RENAME TO tubes;""")
+    oldcols=_cols(c,"tubes")
+    base=["id","uid","sample_name","box_uid","position","status","active","created_at","removed_at"]
+    extra=[(n,t) for n,t in [("volume","REAL"),("volume_unit","TEXT"),("lot","TEXT"),("updated_at","TEXT")] if n in oldcols]
+    fields=base+[n for n,_ in extra]
+    with c:
+        c.execute("DROP TABLE IF EXISTS tubes_new")
+        c.execute("""CREATE TABLE tubes_new(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,uid TEXT UNIQUE NOT NULL,sample_name TEXT,
+          box_uid TEXT NOT NULL,position TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'PRESENT',
+          active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,removed_at TEXT,
+          volume REAL,volume_unit TEXT,lot TEXT,updated_at TEXT)""")
+        columns=",".join(fields)
+        c.execute(f"INSERT INTO tubes_new ({columns}) SELECT {columns} FROM tubes")
+        c.execute("DROP TABLE tubes")
+        c.execute("ALTER TABLE tubes_new RENAME TO tubes")
 
-def init_db():
+def _init_db_schema():
     with connect() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS storage_objects(
@@ -71,3 +79,51 @@ def fetchone(sql,params=()):
 def execute(sql,params=()):
     with connect() as c:
         cur=c.execute(sql,params);c.commit();return cur.lastrowid
+
+
+# ---- V4.2: persistence / safe upgrades ----
+def database_path():
+    """Return the persistent SQLite file used by FreezerFlow."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return DB_PATH
+
+def backup_database(destination=None):
+    """Create a consistent SQLite backup without modifying the live database."""
+    from datetime import datetime
+    if destination is None:
+        backup_dir = DB_PATH.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = backup_dir / f"freezerflow_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with connect() as source, sqlite3.connect(destination) as target:
+        source.backup(target)
+    return destination
+
+def migrate_v42():
+    """Non-destructive V4.2 migration. Existing tubes/history are preserved."""
+    with connect() as c:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(tubes)").fetchall()}
+        additions = {
+            "volume": "REAL",
+            "volume_unit": "TEXT",
+            "lot": "TEXT",
+            "updated_at": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in cols:
+                c.execute(f"ALTER TABLE tubes ADD COLUMN {name} {sql_type}")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations(
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+        """)
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
+                  ("4.2", now()))
+        c.commit()
+
+# V4.2.3 startup wrapper: schema + non-destructive migrations.
+def init_db():
+    _init_db_schema()
+    migrate_v42()
